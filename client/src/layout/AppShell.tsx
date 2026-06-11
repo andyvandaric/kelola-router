@@ -9,6 +9,7 @@ import { TopBar } from './TopBar';
 const Accounts = lazy(() => import('../pages/Accounts').then((m) => ({ default: m.Accounts })));
 const Aliases = lazy(() => import('../pages/Aliases').then((m) => ({ default: m.Aliases })));
 const ClientKeys = lazy(() => import('../pages/ClientKeys').then((m) => ({ default: m.ClientKeys })));
+const Combos = lazy(() => import('../pages/Combos').then((m) => ({ default: m.Combos })));
 const Login = lazy(() => import('../pages/Login').then((m) => ({ default: m.Login })));
 const Models = lazy(() => import('../pages/Models').then((m) => ({ default: m.Models })));
 const NotFound = lazy(() => import('../pages/NotFound').then((m) => ({ default: m.NotFound })));
@@ -26,6 +27,7 @@ const KNOWN_ROUTES = [
   'accounts',
   'models',
   'aliases',
+  'combos',
   'quota',
   'transports',
   'console',
@@ -58,6 +60,8 @@ function Page({ current }: { current: string }) {
       return <Models />;
     case 'aliases':
       return <Aliases />;
+    case 'combos':
+      return <Combos />;
     case 'quota':
       return <Quota />;
     case 'transports':

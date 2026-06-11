@@ -16,6 +16,7 @@ const NAV: NavItem[] = [
   { key: 'accounts', label: 'Upstream', href: '/admin/accounts', icon: 'accounts' },
   { key: 'models', label: 'Models', href: '/admin/models', icon: 'models' },
   { key: 'aliases', label: 'Aliases', href: '/admin/aliases', icon: 'aliases' },
+  { key: 'combos', label: 'Combos', href: '/admin/combos', icon: 'combos' },
   { key: 'quota', label: 'Quota', href: '/admin/quota', icon: 'quota' },
   { key: 'transports', label: 'Proxies', href: '/admin/transports', icon: 'transports' },
   { key: 'console', label: 'Console', href: '/admin/console', icon: 'console' },

@@ -7,6 +7,7 @@ export type IconName =
   | 'accounts'
   | 'models'
   | 'aliases'
+  | 'combos'
   | 'quota'
   | 'settings'
   | 'transports'
@@ -63,6 +64,15 @@ function renderPath(name: IconName): JSX.Element {
         <>
           <path d="M10 13a5 5 0 0 0 7.54.54l3-3a5 5 0 0 0-7.07-7.07l-1.72 1.71" />
           <path d="M14 11a5 5 0 0 0-7.54-.54l-3 3a5 5 0 0 0 7.07 7.07l1.71-1.71" />
+        </>
+      );
+    case 'combos':
+      return (
+        <>
+          <path d="M4 6h16M4 12h16M4 18h16" />
+          <circle cx="8" cy="6" r="1.5" />
+          <circle cx="12" cy="12" r="1.5" />
+          <circle cx="16" cy="18" r="1.5" />
         </>
       );
     case 'quota':
