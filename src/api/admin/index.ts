@@ -4,6 +4,7 @@ import { accountRoutes } from './accounts.js';
 import { aliasRoutes } from './aliases.js';
 import { authRoutes } from './auth.js';
 import { clientKeyRoutes } from './clientKeys.js';
+import { comboRoutes } from './combos.js';
 import { requireAdminJson } from './middleware.js';
 import { modelRoutes } from './models.js';
 import { overviewRoutes } from './overview.js';
@@ -25,6 +26,7 @@ export function adminApi(): Hono {
   app.route('/admin/accounts', accountRoutes);
   app.route('/admin/models', modelRoutes);
   app.route('/admin/aliases', aliasRoutes);
+  app.route('/admin/combos', comboRoutes);
   app.route('/admin', quotaRoutes);
   app.route('/admin/settings', settingsRoutes);
   app.route('/admin/transports', transportRoutes);
