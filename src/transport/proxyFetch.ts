@@ -1,4 +1,5 @@
 import type { Dispatcher } from 'undici';
+import { fetch as undiciFetch } from 'undici';
 import { getDispatcher } from './dispatcherCache.js';
 import { getSocksDispatcher } from './socksLoader.js';
 import type { TransportConfig } from './types.js';
@@ -94,9 +95,7 @@ export async function proxyAwareFetch(
           ? await getSocksDispatcher(proxyUrl)
           : await getDispatcher(proxyUrl);
       if (dispatcher) {
-        return await (
-          globalThis.fetch as (url: string, opts: UndiciFetchOptions) => Promise<Response>
-        )(targetUrl, { ...options, dispatcher });
+        return await undiciFetch(targetUrl, { ...options, dispatcher } as Parameters<typeof undiciFetch>[1]) as unknown as Response;
       }
     } catch (e: unknown) {
       const message = e instanceof Error ? e.message : String(e);
