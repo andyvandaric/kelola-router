@@ -3,12 +3,14 @@ import { migration_001 } from './001-initial.js';
 import { migration_002 } from './002-kiro.js';
 import { migration_003 } from './003-transports.js';
 import { migration_004 } from './004-reqid.js';
+import { migration_005 } from './005-combos.js';
 
 const ALL_MIGRATIONS: Array<{ id: number; name: string; sql: string }> = [
   migration_001,
   migration_002,
   migration_003,
   migration_004,
+  migration_005,
 ];
 
 export function migrate(db: Database.Database): void {
