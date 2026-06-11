@@ -50,6 +50,7 @@ import {
 import { disableModel, enableModel } from './db/repos/models.js';
 import { flushDeferredLogs, insertRequestLogDeferred } from './db/repos/requestLogs.js';
 import { getAllSettings, getSetting, setSetting } from './db/repos/settings.js';
+import { getCombo, type Combo } from './db/repos/combos.js';
 import { resolveModel } from './providers/alias.js';
 import { getUpstreamFormat } from './providers/format/negotiate.js';
 import {
@@ -127,6 +128,386 @@ app.get('/health', (c) => c.json({ ok: true }));
 app.post('/login', handleLogin);
 app.post('/logout', handleLogout);
 
+/**
+ * handleComboProxy — fallback chain handler.
+ * Iterates through the combo's model list in order. For each model:
+ *   1. Resolve model (via alias system)
+ *   2. Select account from the pool
+ *   3. Attempt upstream fetch
+ *   4. On 429 or model-lock: try next model in the chain
+ *   5. On success or non-retryable error: return response
+ */
+async function handleComboProxy(
+  c: Context,
+  format: 'openai' | 'anthropic',
+  upstreamPath: string,
+  body: Record<string, unknown>,
+  originalText: string,
+  db: ReturnType<typeof getDb>,
+  combo: Combo
+): Promise<Response> {
+  const clientKey = c.get('clientKey');
+  const startMs = c.get('startTime');
+  const allSettings = getAllSettings(db);
+  const minimax = allSettings.minimax as { upstreamFormat?: string } | undefined;
+  const overrideRaw = minimax?.upstreamFormat ?? process.env.ROUTER_UPSTREAM_FORMAT ?? 'auto';
+  const upstreamFormat = getUpstreamFormat(format, overrideRaw as 'auto' | 'openai' | 'anthropic');
+
+  const reqId = genReqId();
+  c.set('reqId', reqId);
+  consoleBus.emit(
+    buildStart(
+      reqId,
+      new Date().toISOString(),
+      c.req.method,
+      upstreamPath,
+      `combo:${combo.name}`,
+      combo.name
+    )
+  );
+
+  // Augment body (caveman, caching, rtk) just like handleProxy does.
+  let bodyDirty = false;
+  const caveman = allSettings.caveman as { level: string } | undefined;
+  const caching = allSettings.caching as
+    | { autoBreakpoints: boolean; respectCallerMarkers: boolean }
+    | undefined;
+  const rtkSetting = allSettings.rtk as { enabled: boolean } | undefined;
+  const cavemanOn = !!caveman?.level && caveman.level !== 'off';
+  const cachingOn = !!caching?.autoBreakpoints;
+  if (cavemanOn || cachingOn) {
+    await augmentRequest(body, allSettings as Parameters<typeof augmentRequest>[1]);
+    bodyDirty = true;
+  }
+  if (rtkSetting?.enabled) {
+    compressMessages(body, true);
+    bodyDirty = true;
+  }
+
+  // OpenAI streaming: ensure include_usage
+  if (upstreamFormat === 'openai') {
+    const withUsage = bodyAddsOpenAIStreamUsage(body);
+    if (withUsage !== body) {
+      Object.assign(body, withUsage);
+      bodyDirty = true;
+    }
+  }
+
+  // Cross-format body conversion
+  if (format !== upstreamFormat) {
+    if (format === 'openai' && upstreamFormat === 'anthropic') {
+      Object.assign(body, bodyOpenAIToAnthropic(body));
+    } else if (format === 'anthropic' && upstreamFormat === 'openai') {
+      Object.assign(body, bodyAnthropicToOpenAI(body));
+    }
+    bodyDirty = true;
+  }
+
+  // Account pool
+  const allAccounts = listEnabledAccounts(db);
+  if (allAccounts.length === 0) {
+    return c.json({ error: 'no upstream accounts configured' }, 503);
+  }
+  const accountStates: AccountState[] = allAccounts.map((a) => ({
+    id: a.id,
+    backoffLevel: a.backoff_level,
+    rateLimitedUntil: a.rate_limited_until,
+    lastError: a.last_error ? (safeJsonParse(a.last_error) as AccountState['lastError']) : null,
+    status: a.status as AccountState['status'],
+    enabled: !!a.enabled,
+  }));
+  const selMode = (getSetting<{ mode: SelectionMode }>(db, 'selection'))?.mode ?? 'lowest-backoff';
+  const { account, reason, nextCursor } = selectAccount(accountStates, {
+    mode: selMode,
+    cursor: rrCursor,
+    clientKeyId: clientKey?.id,
+    stickyMap,
+  });
+  if (nextCursor != null) rrCursor = nextCursor;
+  if (!account) return c.json({ error: 'all accounts unavailable' }, 503);
+  const acc = allAccounts.find((a) => a.id === account.id)!;
+  consoleBus.emit(buildAccount(reqId, new Date().toISOString(), acc.label, reason));
+
+  let lastErrorResponse: Response | null = null;
+
+  for (let i = 0; i < combo.models.length; i++) {
+    const modelName = combo.models[i]!;
+    let resolved;
+    try {
+      resolved = resolveModel(db, modelName, body);
+    } catch {
+      // Model not found/disabled — skip to next in chain
+      log.warn({ combo: combo.name, model: modelName }, 'combo: model not resolvable, skipping');
+      continue;
+    }
+
+    // Apply model body transform
+    const attemptBody = { ...body };
+    attemptBody.model = resolved.upstreamModel;
+    resolved.bodyTransform(attemptBody);
+
+    // Check model lock
+    clearExpiredModelLocks(db);
+    if (isModelLockActive(getModelLock(db, account.id, resolved.upstreamModel))) {
+      log.info({ combo: combo.name, model: modelName }, 'combo: model locked, trying next');
+      continue;
+    }
+
+    // Kiro provider: delegate to handleKiroProxy for this model
+    if (resolved.provider === 'kiro') {
+      try {
+        const kiroBody = { ...body, model: modelName };
+        const kiroResp = await handleKiroProxy(c, format, upstreamPath, kiroBody, db);
+        // If we get here without throw, check status
+        if (kiroResp.status === 429) {
+          log.info({ combo: combo.name, model: modelName, status: 429 }, 'combo: kiro rate limited, trying next model');
+          lastErrorResponse = kiroResp;
+          continue;
+        }
+        // Success or non-retryable error
+        log.info({ combo: combo.name, model: modelName, index: i }, 'combo: kiro success on model');
+        return kiroResp;
+      } catch (e: unknown) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log.warn({ combo: combo.name, model: modelName, error: msg }, 'combo: kiro model failed, trying next');
+        lastErrorResponse = c.json({ error: msg }, 502);
+        continue;
+      }
+    }
+
+    const url = upstreamUrl(
+      { provider: PROVIDER, apiKey: acc.api_key, baseUrl: acc.base_url },
+      upstreamFormat,
+      upstreamPath
+    );
+    const headers = upstreamHeaders(
+      { provider: PROVIDER, apiKey: acc.api_key, baseUrl: acc.base_url },
+      attemptBody.stream === true,
+      upstreamFormat
+    );
+    const transport = resolveTransportForAccount(db, acc);
+
+    try {
+      const upstreamBody = JSON.stringify(attemptBody);
+      const resp = await upstreamFetch(url, upstreamBody, headers, transport);
+
+      if (!resp.ok) {
+        const errBody = await resp.text();
+        const parsed = parseError(resp, errBody);
+        const decision = checkFallbackError(
+          resp.status,
+          parsed.message,
+          parsed.baseRespCode,
+          acc.backoff_level,
+          parsed.windowResetMs,
+          parsed.retryAfterSec ? parsed.retryAfterSec * 1000 : undefined
+        );
+
+        // Apply account error state
+        const rateLimitedUntil =
+          decision.cooldownMs > 0
+            ? new Date(Date.now() + decision.cooldownMs).toISOString()
+            : null;
+        updateAccount(db, account.id, {
+          rate_limited_until: rateLimitedUntil,
+          backoff_level: decision.newBackoffLevel ?? 0,
+          last_error: JSON.stringify({
+            status: resp.status,
+            message: errBody.slice(0, 500),
+            timestamp: new Date().toISOString(),
+            baseRespCode: parsed.baseRespCode,
+          }),
+          status: resp.status === 401 ? 'error' : 'active',
+        });
+        if (decision.cooldownMs > 0) {
+          setModelLock(db, account.id, resolved.upstreamModel, decision.cooldownMs);
+        }
+        if (decision.source === 'balance') {
+          disableAccount(db, account.id);
+        }
+
+        // Only retry on 429 (rate limit). Other errors are non-retryable.
+        if (resp.status === 429) {
+          log.info(
+            { combo: combo.name, model: modelName, status: resp.status },
+            'combo: rate limited, trying next model'
+          );
+          lastErrorResponse = c.body(errBody, statusCode(resp.status), {
+            'content-type': resp.headers.get('content-type') ?? 'application/json',
+          });
+          continue;
+        }
+
+        // Non-retryable error — return immediately
+        consoleBus.emit(
+          buildError(reqId, new Date().toISOString(), resp.status, errBody.slice(0, 200))
+        );
+        return c.body(errBody, statusCode(resp.status), {
+          'content-type': resp.headers.get('content-type') ?? 'application/json',
+        });
+      }
+
+      // Success! Clear account errors.
+      if (
+        acc.backoff_level !== 0 ||
+        acc.status !== 'active' ||
+        acc.rate_limited_until !== null ||
+        acc.last_error !== null
+      ) {
+        updateAccount(db, account.id, {
+          rate_limited_until: null,
+          backoff_level: 0,
+          last_error: null,
+          status: 'active',
+        });
+      }
+
+      log.info(
+        { combo: combo.name, model: modelName, index: i },
+        'combo: success on model'
+      );
+
+      // Handle streaming response
+      if (attemptBody.stream === true) {
+        const piped = await pipeWithUsage(resp, format, (usage, raw) => {
+          const prompt = usage?.prompt_tokens ?? 0;
+          const completion = usage?.completion_tokens ?? 0;
+          const cacheCreate = usage?.cache_creation_tokens ?? 0;
+          const cacheRead = usage?.cache_read_tokens ?? 0;
+          const total = usage?.total_tokens ?? prompt + completion;
+          const cost = calculateCost(db, resolved.upstreamModel, {
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cache_creation_tokens: cacheCreate,
+            cache_read_tokens: cacheRead,
+          });
+          insertRequestLogDeferred(db, {
+            client_key_id: clientKey.id,
+            account_id: account.id,
+            model: resolved.upstreamModel,
+            requested_model: combo.name,
+            endpoint: upstreamPath,
+            format: upstreamFormat,
+            prompt_tokens: prompt,
+            completion_tokens: completion,
+            cache_creation_tokens: cacheCreate,
+            cache_read_tokens: cacheRead,
+            total_tokens: total,
+            cost_usd: cost,
+            latency_ms: Date.now() - startMs,
+            status_code: resp.status,
+            base_resp_code: undefined,
+            stream: 1,
+            rtk_bytes_saved: 0,
+            request_body: truncateBody(originalText),
+            response_body: truncateBody(raw),
+            request_headers: headersToJson(c.req.raw.headers),
+            response_headers: headersToJson(resp.headers),
+            req_id: reqId,
+          });
+          consoleBus.emit(
+            buildDone(
+              reqId,
+              new Date().toISOString(),
+              resp.status,
+              null,
+              prompt,
+              completion,
+              cacheRead,
+              cost,
+              Date.now() - startMs
+            )
+          );
+        });
+        return piped;
+      }
+
+      // Handle buffered response
+      let respBody = await resp.text();
+      let usage: {
+        prompt_tokens?: number;
+        completion_tokens?: number;
+        total_tokens?: number;
+        cache_creation_tokens?: number;
+        prompt_tokens_details?: { cached_tokens?: number };
+      } = {};
+      try {
+        const parsedResp = JSON.parse(respBody) as { usage?: typeof usage } & Record<string, unknown>;
+        if (format !== upstreamFormat) {
+          const converted =
+            upstreamFormat === 'anthropic'
+              ? responseAnthropicToOpenAI(parsedResp as Parameters<typeof responseAnthropicToOpenAI>[0])
+              : responseOpenAIToAnthropic(parsedResp as Parameters<typeof responseOpenAIToAnthropic>[0]);
+          respBody = JSON.stringify(converted);
+          const convUsage = (converted as { usage?: typeof usage }).usage;
+          usage = convUsage ?? parsedResp.usage ?? {};
+        } else {
+          usage = parsedResp.usage ?? {};
+        }
+      } catch {
+        /* non-JSON; pass through */
+      }
+      const cost = calculateCost(db, resolved.upstreamModel, {
+        prompt_tokens: usage.prompt_tokens ?? 0,
+        completion_tokens: usage.completion_tokens ?? 0,
+        cache_creation_tokens: usage.cache_creation_tokens ?? 0,
+        cache_read_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+      });
+      insertRequestLogDeferred(db, {
+        client_key_id: clientKey.id,
+        account_id: account.id,
+        model: resolved.upstreamModel,
+        requested_model: combo.name,
+        endpoint: upstreamPath,
+        format: upstreamFormat,
+        prompt_tokens: usage.prompt_tokens ?? 0,
+        completion_tokens: usage.completion_tokens ?? 0,
+        cache_creation_tokens: usage.cache_creation_tokens ?? 0,
+        cache_read_tokens: usage.prompt_tokens_details?.cached_tokens ?? 0,
+        total_tokens: usage.total_tokens ?? 0,
+        cost_usd: cost,
+        latency_ms: Date.now() - startMs,
+        status_code: resp.status,
+        base_resp_code: undefined,
+        stream: 0,
+        rtk_bytes_saved: 0,
+        request_body: truncateBody(originalText),
+        response_body: truncateBody(respBody),
+        request_headers: headersToJson(c.req.raw.headers),
+        response_headers: headersToJson(resp.headers),
+        req_id: reqId,
+      });
+      consoleBus.emit(
+        buildDone(
+          reqId,
+          new Date().toISOString(),
+          resp.status,
+          null,
+          usage.prompt_tokens ?? 0,
+          usage.completion_tokens ?? 0,
+          usage.prompt_tokens_details?.cached_tokens ?? 0,
+          cost,
+          Date.now() - startMs
+        )
+      );
+      return c.body(respBody, statusCode(resp.status), {
+        'content-type': resp.headers.get('content-type') ?? 'application/json',
+      });
+    } catch (e: unknown) {
+      const message = errorMessage(e);
+      log.warn({ combo: combo.name, model: modelName, err: message }, 'combo: upstream error');
+      lastErrorResponse = c.json({ error: `upstream unreachable: ${message}` }, 502);
+      // Network errors are retryable within the combo chain
+      continue;
+    }
+  }
+
+  // All models in the combo exhausted
+  consoleBus.emit(buildError(reqId, new Date().toISOString(), 429, 'combo: all models exhausted'));
+  if (lastErrorResponse) return lastErrorResponse;
+  return c.json({ error: `combo ${combo.name}: all models exhausted` }, 429);
+}
+
 async function handleProxy(
   c: Context,
   format: 'openai' | 'anthropic',
@@ -150,6 +531,14 @@ async function handleProxy(
   markHotPath('proxy:body-parsed');
   const db = c.get('db');
   const allSettings = getAllSettings(db);
+
+  // Combo/fallback chain: if the requested model matches a combo name, handle
+  // it via the combo fallback loop (try each model in sequence).
+  const comboName = stringValue(body.model);
+  const combo = getCombo(db, comboName);
+  if (combo) {
+    return await handleComboProxy(c, format, upstreamPath, body, text, db, combo);
+  }
 
   // Provider routing: if the requested model belongs to a non-MiniMax provider,
   // branch to that provider's path. Unknown models fall through to the MiniMax
@@ -925,7 +1314,7 @@ if (existsSync('./client/dist/index.html')) {
   }
 }
 
-if (import.meta.url === `file://${process.argv[1]}`) {
+if (true) { // patched for Windows: import.meta.url guard doesn't work with backslash paths
   const port = getPort();
   const hostname = getHost();
   serve({ fetch: app.fetch, port, hostname }, (info) => {
